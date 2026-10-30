@@ -176,7 +176,7 @@ Sistem dilengkapi modul evaluasi otomatis terhadap dataset berlabel:
 ---
 
 ## Credit Source Database
-Databae original bisa di download di link provider original ini : https://ieee-dataport.org/documents/foot-arches
+Database original bisa di download di link provider original ini : https://ieee-dataport.org/documents/foot-arches
 
 ## ⚠️ Disclaimer Medis
 > **PENTING**: Sistem ini dikembangkan untuk tujuan edukasi dan skrining awal kelainan biomekanik kaki berbasis citra, **BUKAN** sebagai alat penegak diagnosis medis klinis definitif. Segala keputusan klinis dan intervensi ortopedik wajib dikonsultasikan dengan dokter spesialis ortopedi atau podiatris berlisensi.
