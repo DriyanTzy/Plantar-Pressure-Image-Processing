@@ -20,12 +20,17 @@ def plot_preprocessing_steps(original_bgr, gray, cleaned, filtered, enhanced,
     fig, axes = plt.subplots(1, 5, figsize=(22, 5))
     fig.suptitle(f"Pipeline Preprocessing -- {title}", fontsize=13, fontweight='bold')
     
+    if len(original_bgr.shape) == 3:
+        orig_disp = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        orig_disp = original_bgr
+        
     images = [
-        (cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB), "1. Original (BGR)"),
-        (gray, "2. Grayscale"),
+        (orig_disp, "1. Original"),
+        (gray, "2. Grayscale Norm"),
         (cleaned, "3. Clean Background"),
         (filtered, "4. Median Filter (5x5)"),
-        (enhanced, "5. CLAHE Enhanced"),
+        (enhanced, "5. Enhanced / CLAHE"),
     ]
     
     for ax, (img, label) in zip(axes, images):
@@ -299,24 +304,30 @@ def plot_model_comparison(comparison_data: dict, save_path=None):
 def save_sample_visualization(original_bgr, enhanced, foot_mask, 
                              norm_mask, toe_boundary, regions,
                              arch_index, classification, filename,
-                             save_path):
+                             save_path, modality_str: str = "Citra Tekanan"):
     """Visualisasi multi-panel satu sampel (4 tahap visual)."""
     fig, axes = plt.subplots(1, 4, figsize=(20, 6))
-    fig.suptitle(f"{filename}  |  Arch Index = {arch_index:.4f}  |  Klasifikasi: {classification}",
+    fig.suptitle(f"{filename}  |  Arch Index = {arch_index:.4f}  |  Klasifikasi: {classification}  |  [{modality_str}]",
                  fontsize=12, fontweight='bold')
     
-    axes[0].imshow(cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB))
-    axes[0].set_title("1. Citra Asli (Tekanan)")
+    # Panel 1: Citra Asli Input
+    if len(original_bgr.shape) == 3:
+        axes[0].imshow(cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB))
+    else:
+        axes[0].imshow(original_bgr, cmap='gray')
+    axes[0].set_title("1. Citra Asli Input")
     axes[0].axis('off')
     
+    # Panel 2: Enhanced + Segmentasi Mask
     overlay = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
     mask_layer = np.zeros_like(overlay)
     mask_layer[foot_mask > 0] = [0, 220, 0]
     blended = cv2.addWeighted(overlay, 0.7, mask_layer, 0.3, 0)
     axes[1].imshow(blended)
-    axes[1].set_title("2. Enhanced + Segmentasi Mask")
+    axes[1].set_title("2. Preprocessed & Mask")
     axes[1].axis('off')
     
+    # Panel 3: Normalisasi Orientasi & Pemotongan Jari Kaki
     mask_rgb = cv2.cvtColor(norm_mask, cv2.COLOR_GRAY2RGB)
     if 0 < toe_boundary < norm_mask.shape[0]:
         cv2.line(mask_rgb, (0, toe_boundary), (norm_mask.shape[1], toe_boundary), (255, 230, 0), 2)
@@ -324,6 +335,7 @@ def save_sample_visualization(original_bgr, enhanced, foot_mask,
     axes[2].set_title(f"3. Normalisasi & Toe Cut (y={toe_boundary})")
     axes[2].axis('off')
     
+    # Panel 4: Regio Cavanagh (A, B, C)
     h, w = norm_mask.shape[:2]
     region_vis = np.zeros((h, w, 3), dtype=np.uint8)
     region_vis[regions['A_mask'] > 0] = [220, 70, 70]

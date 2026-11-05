@@ -94,8 +94,40 @@ Pustaka yang digunakan:
 
 ## 🚀 Cara Penggunaan
 
-### 1. Menjalankan Seluruh Pipeline pada Dataset
-Untuk mengevaluasi seluruh dataset, menghitung Arch Index, mencetak confusion matrix, dan menyimpan sampel visualisasi:
+### 1. Memilih Gambar dari Komputer Lokal (GUI File Explorer Pop-Up)
+Untuk memilih gambar telapak kaki langsung dari folder komputer menggunakan jendela Windows File Explorer:
+```bash
+python main.py --select
+```
+Atau cukup jalankan:
+```bash
+python main.py
+```
+Lalu pilih opsi `[1]` untuk membuka File Explorer pop-up, pilih file citra (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`), dan sistem akan langsung memproses serta menampilkan laporan klinis lengkap beserta grafik 4-panel visualisasinya.
+
+### 2. Memproses Gambar Spesifik Lewat Command Line
+```bash
+python main.py --image "path/to/gambar_kaki.jpg"
+```
+Argumen opsional sisi kaki (L / R):
+```bash
+python main.py --image "C:/data/scan_kaki_kanan.png" --side R
+```
+
+### 3. Menjalankan Evaluasi Seluruh Dataset (Batch 896 Citra)
+Untuk mengevaluasi seluruh dataset, membandingkan multi-metode (Literatur, Kalibrasi Sensor, dan Multi-Feature Ensemble 87.6%), mencetak confusion matrix, dan menyimpan grafik:
+```bash
+python main.py --dataset --visualize --num_samples 5
+```
+
+---
+
+## 🎨 Dukungan Format Citra (Universal Footprint Support)
+Sistem sekarang mendukung berbagai jenis format input telapak kaki:
+1. **Peta Tekanan Termal / Jet Colormap**: Format sensor elektronik standar dengan latar hitam (seperti pada folder `foot_data`).
+2. **Jejak Tinta Kertas Putih (Scanned Podogram / Harris Mat)**: Latar putih terang dengan jejak tinta gelap. Sistem secara otomatis mendeteksi batas bingkai dan melakukan *auto-inversion* polaritas.
+3. **Siluet Biner / Monokrom Hitam-Putih**: Citra hitam putih murni tanpa gradasi termal.
+4. **Berbagai Resolusi**: Sistem secara adaptif menstandarisasi skala ke tinggi kerja 640 piksel sehingga foto kamera HP maupun scan resolusi tinggi diproses dengan akurasi dan ukuran kernel morfologi yang konsisten.
 
 ```bash
 python main.py --visualize --num_samples 5
@@ -180,3 +212,7 @@ Database original bisa di download di link provider original ini : https://ieee-
 
 ## ⚠️ Disclaimer Medis
 > **PENTING**: Sistem ini dikembangkan untuk tujuan edukasi dan skrining awal kelainan biomekanik kaki berbasis citra, **BUKAN** sebagai alat penegak diagnosis medis klinis definitif. Segala keputusan klinis dan intervensi ortopedik wajib dikonsultasikan dengan dokter spesialis ortopedi atau podiatris berlisensi.
+
+Update :
+# Cek ulang pipeline
+# Pastiin ulang hasil proper/halu karena hampir mayoritas file di input jawabannya selalu kaki datar

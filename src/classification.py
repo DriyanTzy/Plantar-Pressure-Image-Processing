@@ -11,35 +11,43 @@ Fungsi utama:
 =============================================================================
 """
 
-# Threshold Literatur Cavanagh & Rodgers (1987)
+# Threshold Literatur Cavanagh & Rodgers (1987) untuk Jejak Tinta Kertas (Ink Print)
 CAVANAGH_THRESHOLDS = {
     'high_arch': 0.21,   # AI <= 0.21
     'flat_foot': 0.26,   # AI >= 0.26
 }
 
+# Threshold Terkalibrasi untuk Sensor Tekanan Plantar Digital (Electronic Mat)
+SENSOR_CALIBRATED_THRESHOLDS = {
+    'high_arch': 0.22,   # AI <= 0.22
+    'flat_foot': 0.33,   # AI >= 0.33
+}
+
 
 def classify_arch(arch_index: float, 
-                  high_thresh: float = 0.21, 
-                  flat_thresh: float = 0.26) -> str:
+                  high_thresh: float = None, 
+                  flat_thresh: float = None,
+                  mode: str = 'calibrated') -> str:
     """
     Klasifikasi tipe lengkungan kaki berdasarkan Arch Index.
     
-    Threshold Standar (Cavanagh & Rodgers, 1987):
-        AI <= 0.21       : High Arch (Pes Cavus)
-        0.21 < AI < 0.26 : Normal
-        AI >= 0.26       : Flat Foot (Pes Planus)
-    
-    Args:
-        arch_index: Nilai Arch Index (B / (A + B + C)).
-        high_thresh: Batas atas untuk High Arch (default: 0.21).
-        flat_thresh: Batas bawah untuk Flat Foot (default: 0.26).
-        
-    Returns:
-        String klasifikasi: 'High Arch', 'Normal', atau 'Flat Foot'.
+    Mode:
+      - 'calibrated': Ambang batas terkalibrasi khusus sensor tekanan plantar digital
+                      (High Arch <= 0.22, Normal 0.22-0.33, Flat Foot >= 0.33).
+      - 'cavanagh'  : Ambang batas literatur klasik Cavanagh & Rodgers 1987
+                      (High Arch <= 0.21, Normal 0.21-0.26, Flat Foot >= 0.26).
     """
     if arch_index < 0:
         return 'Invalid'
-    
+        
+    if high_thresh is None or flat_thresh is None:
+        if mode == 'cavanagh':
+            high_thresh = CAVANAGH_THRESHOLDS['high_arch']
+            flat_thresh = CAVANAGH_THRESHOLDS['flat_foot']
+        else:
+            high_thresh = SENSOR_CALIBRATED_THRESHOLDS['high_arch']
+            flat_thresh = SENSOR_CALIBRATED_THRESHOLDS['flat_foot']
+            
     if arch_index <= high_thresh:
         return 'High Arch'
     elif arch_index >= flat_thresh:
