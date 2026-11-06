@@ -349,3 +349,34 @@ def save_sample_visualization(original_bgr, enhanced, foot_mask,
     plt.tight_layout()
     plt.savefig(save_path, dpi=120, bbox_inches='tight')
     plt.close()
+
+
+def plot_cnn_history(history: dict, save_path: str = None):
+    """
+    Plot kurva Loss dan Akurasi selama 15 epoch pelatihan FootNet CNN.
+    """
+    import matplotlib.pyplot as plt
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    
+    # Loss Curve
+    ax1.plot(epochs, history['train_loss'], 'r-o', linewidth=2, markersize=5, label='Training Loss')
+    ax1.set_title('FootNet CNN: Training Loss (15 Epochs)', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss (CrossEntropy)')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    ax1.legend()
+    
+    # Accuracy Curve
+    ax2.plot(epochs, [a * 100 for a in history['train_acc']], 'b-s', linewidth=2, markersize=5, label='Training Accuracy')
+    ax2.set_title('FootNet CNN: Training Accuracy (15 Epochs)', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    ax2.legend()
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()

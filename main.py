@@ -59,8 +59,9 @@ from evaluation import (evaluate_predictions, print_evaluation,
 from visualization import (plot_preprocessing_steps, plot_regions,
                            plot_evaluation, plot_ai_distribution,
                            plot_feature_importance, plot_model_comparison,
-                           save_sample_visualization)
+                           plot_cnn_history, save_sample_visualization)
 from ml_classifier import train_and_cross_validate_ml
+from gpu_model import train_and_evaluate_footnet, predict_single_image_cnn
 
 warnings.filterwarnings('ignore')
 
@@ -166,6 +167,7 @@ def process_single_image(image_path: str, side: str = 'L',
         
         return {
             'filename': filename,
+            'image_path': image_path,
             'side': side,
             'arch_index': arch_index,
             'classification': classification,
@@ -351,8 +353,8 @@ def find_optimal_thresholds(results: list) -> tuple:
     return round(float(best_th1), 3), round(float(best_th2), 3), best_acc
 
 
-def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = False, num_samples: int = 5, gpu: bool = False):
-    """Menjalankan evaluasi lengkap terhadap seluruh dataset 896 citra."""
+def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = False, num_samples: int = 5, gpu: bool = False, epochs: int = 15):
+    """Menjalankan evaluasi lengkap terhadap seluruh dataset citra."""
     reports_dir = os.path.join(output_dir, 'reports')
     os.makedirs(reports_dir, exist_ok=True)
     
@@ -425,6 +427,29 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     plot_feature_importance(eval_ml['feature_importances'], save_path=feat_imp_path)
     print(f"-> Grafik kontribusi fitur biomekanik tersimpan di: {feat_imp_path}")
     
+    # E. Metode 4: Deep Learning CNN (FootNet - 15 Epochs)
+    print("\n" + "=" * 70)
+    print(f"   METODE 4: DEEP LEARNING CNN (FOOTNET MULTI-MODAL - {epochs} EPOCHS)")
+    print("   Menggabungkan Fitur Visual Spasial CNN & Parameter Biomekanik Klinis")
+    print("=" * 70)
+    cnn_model_path = os.path.join(output_dir, 'models', 'footnet_cnn.pt')
+    eval_cnn = train_and_evaluate_footnet(valid_results, epochs=epochs, batch_size=64, save_model_path=cnn_model_path)
+    comparison_summary[f'4. FootNet CNN ({epochs} Ep)'] = eval_cnn['accuracy']
+    
+    print_evaluation({'confusion_matrix': eval_cnn['confusion_matrix'],
+                      'metrics': eval_cnn['metrics'],
+                      'total_errors': int(eval_cnn['metrics']['total_samples'] - eval_cnn['metrics']['correct']),
+                      'error_distribution': {}},
+                     title=f"Metode 4: FootNet Deep Learning CNN ({epochs} Epochs)")
+    plot_evaluation({'confusion_matrix': eval_cnn['confusion_matrix'],
+                     'metrics': eval_cnn['metrics']},
+                    save_path=os.path.join(reports_dir, 'confusion_matrix_cnn.png'),
+                    title=f"Metode 4: FootNet CNN ({epochs} Epochs)")
+    
+    cnn_hist_path = os.path.join(reports_dir, 'cnn_training_history.png')
+    plot_cnn_history(eval_cnn['history'], save_path=cnn_hist_path)
+    print(f"-> Grafik kurva loss & akurasi CNN tersimpan di: {cnn_hist_path}")
+    
     comp_plot_path = os.path.join(reports_dir, 'comparison_methods.png')
     plot_model_comparison(comparison_summary, save_path=comp_plot_path)
     print(f"-> Grafik komparasi multi-metode tersimpan di: {comp_plot_path}")
@@ -447,6 +472,7 @@ def main():
     parser.add_argument('--visualize', action='store_true', help='Simpan visualisasi sampel')
     parser.add_argument('--num_samples', type=int, default=5, help='Jumlah sampel per kelas yang divisualisasikan')
     parser.add_argument('--gpu', action='store_true', help='Jalankan FootNet Deep Learning di GPU RTX')
+    parser.add_argument('--epochs', type=int, default=15, help='Jumlah epoch pelatihan FootNet CNN (default: 15)')
     args = parser.parse_args()
     
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -479,7 +505,7 @@ def main():
     # ── KONDISI 3: Pengguna Meminta Batch Processing Dataset (--dataset) ──
     if args.dataset:
         data_dir = os.path.join(base_dir, args.data_dir)
-        run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu)
+        run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu, epochs=args.epochs)
         return
         
     # ── KONDISI 4: Dijalankan Tanpa Argumen (Menu Interaktif Ramah Pengguna) ──
@@ -490,7 +516,7 @@ def main():
     print("Pilihan Menu:")
     print("  [1] Pilih gambar dari komputer (Buka File Explorer Pop-up)")
     print("  [2] Masukkan path gambar lokal secara manual")
-    print("  [3] Jalankan batch evaluasi seluruh dataset (896 citra)")
+    print("  [3] Jalankan batch evaluasi seluruh dataset & Train CNN (15 Epochs)")
     print("  [4] Keluar")
     print("-" * 65)
     
@@ -531,7 +557,7 @@ def main():
         
     elif pilihan == "3":
         data_dir = os.path.join(base_dir, args.data_dir)
-        run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu)
+        run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu, epochs=args.epochs)
         
     else:
         print("[INFO] Program selesai.")
