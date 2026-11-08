@@ -198,21 +198,24 @@ Jika $\Delta \text{AI} \ge 0.05$, sistem mengeluarkan peringatan asimetri strukt
 
 ---
 
-## 📊 Evaluasi Performa
-Sistem dilengkapi modul evaluasi otomatis terhadap dataset berlabel:
-- **Confusion Matrix Multikelas**
-- **Metrik per Kelas**: Sensitivity (Recall), Specificity, Precision, F1-Score
-- **Overall Accuracy & Macro-averaged Metrics**
-- **Distribusi Error Analysis**: Meninjau kasus batas (*boundary cases*) antara Normal dan High Arch/Flat Foot.
+## 📊 Evaluasi Performa & Anti-Overfitting Architecture
+Sistem dilengkapi modul evaluasi otomatis terhadap dataset berlabel dan perlindungan terhadap *data leakage*:
+- **Group-Aware Splitting (GroupKFold by Base Subject ID)**:
+  Mencegah citra kembar hasil augmentasi berada di set pelatihan dan pengujian sekaligus. Menghilangkan ilusi akurasi 99% akibat hafalan dataset (*data leakage*), sehingga akurasi evaluasi mencerminkan generalisasi nyata pada kaki yang belum pernah dilihat model sebelumnya.
+- **Dynamic Orientation & Polarity Invariance**:
+  Pipeline secara matematis invariant terhadap rotasi, orientasi terbalik (jari di bawah), serta pembalikan cermin (kaki kiri <-> kanan).
+- **Confusion Matrix Multikelas & Metrik per Kelas**:
+  Sensitivity (Recall), Specificity, Precision, F1-Score, dan perbandingan lintas metode.
 
 ---
 
-## Credit Source Database
-Database original bisa di download di link provider original ini : https://ieee-dataport.org/documents/foot-arches
+## 📚 Credit Source Database
+Database original dapat diunduh di penyedia resmi: [IEEE DataPort - Foot Arches](https://ieee-dataport.org/documents/foot-arches)
+
+---
 
 ## ⚠️ Disclaimer Medis
 > **PENTING**: Sistem ini dikembangkan untuk tujuan edukasi dan skrining awal kelainan biomekanik kaki berbasis citra, **BUKAN** sebagai alat penegak diagnosis medis klinis definitif. Segala keputusan klinis dan intervensi ortopedik wajib dikonsultasikan dengan dokter spesialis ortopedi atau podiatris berlisensi.
 
-Update :
-# Cek ulang pipeline
-# Pastiin ulang hasil proper/halu karena hampir mayoritas file di input jawabannya selalu kaki datar
+## Next Update 
+- Optimalisasi detect cuda ini gw ada rtx 5050 ga kebaca anjeng jadi berat cpu

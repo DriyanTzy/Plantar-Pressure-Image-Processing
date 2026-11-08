@@ -99,8 +99,10 @@ def parse_file_info(filename: str, folder_label: str = 'U') -> dict:
     stem = Path(filename).stem
     if '_R_' in filename or '_R.' in filename or filename.startswith('R_') or '_foot_R' in filename or 'right' in filename.lower():
         side = 'R'
-    else:
+    elif '_L_' in filename or '_L.' in filename or filename.startswith('L_') or '_foot_L' in filename or 'left' in filename.lower():
         side = 'L'
+    else:
+        side = None
         
     ground_truth = LABEL_MAP.get(folder_label, 'Unknown')
     return {
@@ -137,8 +139,9 @@ def process_single_image(image_path: str, side: str = 'L',
                 'info': info,
             }
         
-        # Step 4: Normalisasi Orientasi (PCA & Standardisasi Sisi)
-        norm_img, norm_mask = normalize_orientation(prep['enhanced'], foot_mask, side)
+        # Step 4: Normalisasi Orientasi (PCA, Inversi Upside-Down & Standardisasi Sisi)
+        norm_img, norm_mask, detected_side = normalize_orientation(prep['enhanced'], foot_mask, side)
+        side = detected_side
         
         # Step 5: Pemisahan Jari Kaki (Toe Separation)
         toe_boundary, foot_no_toes = separate_toes(norm_mask)
@@ -433,18 +436,24 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     print("   Menggabungkan Fitur Visual Spasial CNN & Parameter Biomekanik Klinis")
     print("=" * 70)
     cnn_model_path = os.path.join(output_dir, 'models', 'footnet_cnn.pt')
-    eval_cnn = train_and_evaluate_footnet(valid_results, epochs=epochs, batch_size=64, save_model_path=cnn_model_path)
-    comparison_summary[f'4. FootNet CNN ({epochs} Ep)'] = eval_cnn['accuracy']
+    eval_cnn = train_and_evaluate_footnet(valid_results, epochs=epochs, batch_size=64, expand_factor=10, save_model_path=cnn_model_path)
+    comparison_summary[f'4. FootNet CNN Val ({epochs} Ep)'] = eval_cnn['accuracy']
+    comparison_summary[f'5. FootNet CNN Ground Truth ({epochs} Ep)'] = eval_cnn['holdout_accuracy']
     
     print_evaluation({'confusion_matrix': eval_cnn['confusion_matrix'],
                       'metrics': eval_cnn['metrics'],
                       'total_errors': int(eval_cnn['metrics']['total_samples'] - eval_cnn['metrics']['correct']),
                       'error_distribution': {}},
-                     title=f"Metode 4: FootNet Deep Learning CNN ({epochs} Epochs)")
+                     title=f"Metode 4: FootNet CNN - Validation Set ({epochs} Epochs)")
     plot_evaluation({'confusion_matrix': eval_cnn['confusion_matrix'],
                      'metrics': eval_cnn['metrics']},
-                    save_path=os.path.join(reports_dir, 'confusion_matrix_cnn.png'),
-                    title=f"Metode 4: FootNet CNN ({epochs} Epochs)")
+                    save_path=os.path.join(reports_dir, 'confusion_matrix_cnn_val.png'),
+                    title=f"Metode 4: FootNet CNN Val ({epochs} Epochs)")
+                    
+    plot_evaluation({'confusion_matrix': eval_cnn['holdout_confusion_matrix'],
+                     'metrics': eval_cnn['holdout_metrics']},
+                    save_path=os.path.join(reports_dir, 'confusion_matrix_cnn_holdout.png'),
+                    title=f"Metode 4: FootNet CNN Holdout Ground Truth ({epochs} Epochs)")
     
     cnn_hist_path = os.path.join(reports_dir, 'cnn_training_history.png')
     plot_cnn_history(eval_cnn['history'], save_path=cnn_hist_path)
@@ -467,12 +476,13 @@ def main():
     parser.add_argument('--select', action='store_true', help='Buka File Picker dialog untuk memilih gambar dari lokal')
     parser.add_argument('--side', type=str, default=None, choices=['L', 'R'], help='Sisi kaki: L (Kiri) atau R (Kanan)')
     parser.add_argument('--dataset', action='store_true', help='Jalankan evaluasi batch terhadap seluruh dataset')
+    parser.add_argument('--train-cnn', '--train', action='store_true', dest='train_cnn', help='Latih FootNet CNN dengan 10x On-the-fly Dynamic Augmentation')
     parser.add_argument('--data_dir', type=str, default='foot_data', help='Path dataset folder')
     parser.add_argument('--output_dir', type=str, default='output', help='Path output folder')
     parser.add_argument('--visualize', action='store_true', help='Simpan visualisasi sampel')
     parser.add_argument('--num_samples', type=int, default=5, help='Jumlah sampel per kelas yang divisualisasikan')
     parser.add_argument('--gpu', action='store_true', help='Jalankan FootNet Deep Learning di GPU RTX')
-    parser.add_argument('--epochs', type=int, default=15, help='Jumlah epoch pelatihan FootNet CNN (default: 15)')
+    parser.add_argument('--epochs', type=int, default=10, help='Jumlah epoch pelatihan FootNet CNN (default: 10)')
     args = parser.parse_args()
     
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -502,8 +512,8 @@ def main():
         print_single_image_report(res)
         return
         
-    # ── KONDISI 3: Pengguna Meminta Batch Processing Dataset (--dataset) ──
-    if args.dataset:
+    # ── KONDISI 3: Pengguna Meminta Batch Processing Dataset (--dataset / --train-cnn) ──
+    if args.dataset or args.train_cnn:
         data_dir = os.path.join(base_dir, args.data_dir)
         run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu, epochs=args.epochs)
         return
@@ -516,7 +526,7 @@ def main():
     print("Pilihan Menu:")
     print("  [1] Pilih gambar dari komputer (Buka File Explorer Pop-up)")
     print("  [2] Masukkan path gambar lokal secara manual")
-    print("  [3] Jalankan batch evaluasi seluruh dataset & Train CNN (15 Epochs)")
+    print("  [3] Jalankan batch evaluasi seluruh dataset & Train FootNet CNN (10 Epochs, 10x Dynamic Augment)")
     print("  [4] Keluar")
     print("-" * 65)
     

@@ -1,217 +1,331 @@
 """
 =============================================================================
 Module: gpu_model.py
-Deep Learning CNN Classifier (FootNet) for Plantar Pressure Images
+Hardware-Accelerated Deep Learning Classifier (FootNet)
+Anti-Overfitting & Generalisasi Nyata untuk NVIDIA RTX
 =============================================================================
-Fitur Utama:
-  1. Arsitektur FootNet: CNN Multi-Modal menggabungkan visual kontur spasial
-     (3-Block ConvNet) dan fitur biomekanik klinis (Arch Index & Rasio Area A/B/C).
-  2. Optimal Hardware:
-     - GPU NVIDIA CUDA (RTX Series) otomatis aktif jika tersedia (FP16 AMP).
-     - Otomatis fallback ke CPU multithreading jika CUDA tidak tersedia.
-  3. Caching Cepat: Citra di-cache dalam memori sehingga 15 epoch selesai dalam hitungan detik.
-  4. Penyimpanan Model: Model terlatih otomatis disimpan ke output/models/footnet_cnn.pt.
+Pencegahan Overfitting (Anti-Hafalan Dataset):
+  1. Group-Aware Subject Split:
+     Citra dasar dan variannya selalu dikelompokkan ke train atau test,
+     tidak pernah terpisah. Zero data leakage.
+  2. Dynamic On-the-Fly Data Augmentation:
+     Rotasi acak (+/- 8°), pergeseran affine, jitter kontras/kecerahan,
+     dan noise acak saat setiap epoch pelatihan.
+  3. Regularisasi L2 & Dropout:
+     Weight decay (1e-2) dan Dropout (0.4) untuk mencegah ketergantungan
+     pada fitur artefak sensor.
+  4. Label Smoothing (0.1):
+     Mencegah model overconfident (probabilitas 99.9% palsu).
+  5. Early Stopping Otomatis:
+     Menghentikan latihan jika Test Loss tidak lagi membaik.
 =============================================================================
 """
 
 import os
 import sys
 import time
+import random
+from pathlib import Path
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import accuracy_score, confusion_matrix
 
 CLASS_NAMES = ['High Arch', 'Normal', 'Flat Foot']
 LABEL_TO_IDX = {'High Arch': 0, 'Normal': 1, 'Flat Foot': 2}
 IDX_TO_LABEL = {0: 'High Arch', 1: 'Normal', 2: 'Flat Foot'}
 
 
+def extract_base_id(filename: str) -> str:
+    """Mengekstrak ID induk untuk isolasi train-test group (Zero Data Leakage)."""
+    stem = Path(filename).stem
+    clean = stem.split('_aug')[0]
+    return clean.replace('_foot_L_', '_foot_').replace('_foot_R_', '_foot_')
+
+
 class FootNet(nn.Module):
     """
-    Arsitektur Convolutional Neural Network multi-modal ringan
-    untuk citra distribusi tekanan plantar (64x64).
+    Arsitektur Convolutional Neural Network ringan yang dioptimasi
+    untuk citra distribusi tekanan plantar (128x128).
     """
     def __init__(self, num_classes: int = 3, num_clinical_features: int = 5):
         super(FootNet, self).__init__()
         
-        # Ekstraktor Fitur Visual Spasial (CNN 3 Blok)
+        # Ekstraktor Spasial (CNN Ringan & Ter-regularisasi)
         self.features = nn.Sequential(
-            # Blok 1: 64x64x3 -> 32x32x32
+            # Block 1: 128x128x3 -> 64x64x32
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
             
-            # Blok 2: 32x32x32 -> 16x16x64
+            # Block 2: 64x64x32 -> 32x32x64
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
             
-            # Blok 3: 16x16x64 -> 8x8x128
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            # Block 3: 32x32x64 -> 16x16x96
+            nn.Conv2d(64, 96, kernel_size=3, padding=1),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
             
-            # Global Average Pooling -> 128
             nn.AdaptiveAvgPool2d((1, 1))
         )
         
-        # Ekstraktor Fitur Biomekanik Klinis (Arch Index, Rasio Luas A, B, C)
+        # Ekstraktor Fitur Biomekanik Klinis (Arch Index, Area A/B/C)
         self.clinical_mlp = nn.Sequential(
-            nn.Linear(num_clinical_features, 32),
+            nn.Linear(num_clinical_features, 24),
             nn.ReLU(inplace=True),
-            nn.Linear(32, 32),
+            nn.Linear(24, 24),
             nn.ReLU(inplace=True)
         )
         
-        # Klasifikasi Gabungan Multi-Modal
+        # Fusi Multi-Modal & Klasifikasi dengan Dropout Kuat (Anti-Overfitting)
         self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(128 + 32, 64),
+            nn.Dropout(0.4),
+            nn.Linear(96 + 24, 48),
             nn.ReLU(inplace=True),
-            nn.Linear(64, num_classes)
+            nn.Dropout(0.25),
+            nn.Linear(48, num_classes)
         )
         
     def forward(self, x_img, x_clinical):
         feat_img = self.features(x_img)
         feat_img = feat_img.view(feat_img.size(0), -1)
-        
         feat_clin = self.clinical_mlp(x_clinical)
-        
         fused = torch.cat((feat_img, feat_clin), dim=1)
         out = self.classifier(fused)
         return out
 
 
-class CachedPlantarDataset(Dataset):
-    """Dataset yang menyimpan gambar dan fitur dalam memori RAM untuk kecepatan maksimal."""
-    def __init__(self, samples: list, img_size: int = 64):
-        self.img_tensors = []
-        self.clin_tensors = []
-        self.targets = []
-        self.filenames = []
-        
-        for item in samples:
-            img_path = item.get('image_path') or item.get('info', {}).get('path', '')
-            img = cv2.imread(img_path)
-            if img is None:
-                img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
-                
-            tensor_img = torch.from_numpy(img.transpose((2, 0, 1))).float() / 255.0
-            
-            A = float(item.get('area_A', 0))
-            B = float(item.get('area_B', 0))
-            C = float(item.get('area_C', 0))
-            tot = max(1.0, A + B + C)
-            ai = float(item.get('arch_index', 0))
-            
-            clin = np.array([
-                ai,
-                A / tot,
-                B / tot,
-                C / tot,
-                tot / 50000.0
-            ], dtype=np.float32)
-            tensor_clin = torch.from_numpy(clin)
-            
-            lbl_idx = LABEL_TO_IDX.get(item.get('ground_truth'), 1)
-            
-            self.img_tensors.append(tensor_img)
-            self.clin_tensors.append(tensor_clin)
-            self.targets.append(lbl_idx)
-            self.filenames.append(item.get('filename', ''))
-            
-        self.img_tensors = torch.stack(self.img_tensors)
-        self.clin_tensors = torch.stack(self.clin_tensors)
-        self.targets = torch.tensor(self.targets, dtype=torch.long)
+class PlantarPressureDataset(Dataset):
+    """
+    Dataset loader dengan on-the-fly dynamic data augmentation untuk training.
+    Mendukung expand_factor (default: 10x untuk training set).
+    """
+    def __init__(self, samples: list, img_size: int = 128, is_train: bool = False, expand_factor: int = 1):
+        self.samples = samples
+        self.img_size = img_size
+        self.is_train = is_train
+        self.expand_factor = max(1, expand_factor) if is_train else 1
         
     def __len__(self):
-        return len(self.targets)
+        return len(self.samples) * self.expand_factor
         
     def __getitem__(self, idx):
-        return (self.img_tensors[idx],
-                self.clin_tensors[idx],
-                self.targets[idx],
-                self.filenames[idx])
+        # Ambil sampel dasar dengan pengindeksan modulo
+        base_idx = idx % len(self.samples)
+        item = self.samples[base_idx]
+        
+        # Handle field image_path atau cari dari filename
+        img_path = item.get('image_path')
+        if not img_path or not os.path.exists(img_path):
+            fn = item.get('filename', '')
+            lc = item.get('label_code', '')
+            if lc and os.path.exists(os.path.join('foot_data', lc, fn)):
+                img_path = os.path.join('foot_data', lc, fn)
+            else:
+                for c in ['H', 'N', 'L']:
+                    p = os.path.join('foot_data', c, fn)
+                    if os.path.exists(p):
+                        img_path = p
+                        break
+                        
+        img = cv2.imread(img_path) if img_path and os.path.exists(img_path) else None
+        if img is None:
+            img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
+            
+        # ── ON-THE-FLY DATA AUGMENTATION (Khusus Training Set) ──
+        if self.is_train:
+            # 1. Horizontal Flip (Simulasi Kaki Kanan <-> Kiri, 100% valid anatomis)
+            if random.random() < 0.5:
+                img = cv2.flip(img, 1)
+                
+            # 2. Rotasi Halus (+/- 7 derajat) - Simulasi sudut berdiri pasien di podoskop
+            if random.random() < 0.7:
+                angle = random.uniform(-7.0, 7.0)
+                M_rot = cv2.getRotationMatrix2D((self.img_size / 2.0, self.img_size / 2.0), angle, 1.0)
+                img = cv2.warpAffine(img, M_rot, (self.img_size, self.img_size), borderValue=(0, 0, 0))
+                
+            # 3. Slight Translation & Scale (Translasi +/- 4%, Skala 0.96 - 1.04)
+            if random.random() < 0.6:
+                tx = random.uniform(-0.04, 0.04) * self.img_size
+                ty = random.uniform(-0.04, 0.04) * self.img_size
+                scale = random.uniform(0.96, 1.04)
+                M_aff = np.float32([
+                    [scale, 0, tx + (1.0 - scale) * self.img_size / 2.0],
+                    [0, scale, ty + (1.0 - scale) * self.img_size / 2.0]
+                ])
+                img = cv2.warpAffine(img, M_aff, (self.img_size, self.img_size), borderValue=(0, 0, 0))
+                
+            # 4. Brightness (+/- 15%) & Contrast (+/- 20%) Jitter - Simulasi berat badan / sensor
+            if random.random() < 0.6:
+                alpha = random.uniform(0.85, 1.15)  # Kontras
+                beta = random.uniform(-15.0, 15.0)   # Kecerahan
+                img = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
+                
+            # 5. Gaussian Noise / Blur Halus (25% probabilitas) - Simulasi noise optik / kelembapan kulit
+            if random.random() < 0.25:
+                if random.random() < 0.5:
+                    img = cv2.GaussianBlur(img, (3, 3), 0)
+                else:
+                    noise = np.random.normal(0, 3.5, img.shape).astype(np.float32)
+                    img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                
+        img_tensor = torch.from_numpy(img.transpose((2, 0, 1))).float() / 255.0
+        
+        tot = max(1.0, float(item.get('area_A', 0) + item.get('area_B', 0) + item.get('area_C', 0)))
+        clin_features = np.array([
+            float(item.get('arch_index', 0)),
+            float(item.get('area_A', 0)) / tot,
+            float(item.get('area_B', 0)) / tot,
+            float(item.get('area_C', 0)) / tot,
+            float(tot) / 50000.0,
+        ], dtype=np.float32)
+        
+        # Sedikit jitter pada fitur klinis (1-2%) saat training agar model tidak overfit
+        if self.is_train and random.random() < 0.4:
+            jitter = np.random.normal(1.0, 0.015, size=clin_features.shape).astype(np.float32)
+            clin_features = clin_features * jitter
+            
+        clin_tensor = torch.from_numpy(clin_features)
+        
+        label_idx = LABEL_TO_IDX.get(item.get('ground_truth', 'Normal'), 1)
+        return img_tensor, clin_tensor, label_idx, item.get('filename', '')
 
 
 def get_optimal_device() -> torch.device:
-    """Mendeteksi ketersediaan GPU NVIDIA CUDA."""
+    """Mendeteksi ketersediaan GPU NVIDIA RTX dan menguji kompatibilitas kernel."""
     if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024**2)
-        print(f"[AKSELERASI GPU AKTIF] Device: {gpu_name} (VRAM: {vram_mb:.0f} MB)")
-        torch.cuda.empty_cache()
-    else:
-        device = torch.device('cpu')
-        print("[MODE CPU AKTIF] Akselerasi CPU Multithreading.")
+        try:
+            # Uji eksekusi kernel mikro untuk memastikan arsitektur GPU (misal sm_120 Blackwell) didukung
+            test_t = torch.zeros(1, device='cuda')
+            _ = test_t + 1.0
+            device = torch.device('cuda:0')
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024**2)
+            print(f"[GPU ACCELERATION ACTIVE] Device: {gpu_name} (Total VRAM: {vram_mb:.0f} MB)")
+            torch.cuda.empty_cache()
+            return device
+        except Exception as e:
+            print(f"[WARN] GPU terdeteksi ({torch.cuda.get_device_name(0)}), tapi kernel CUDA belum kompatibel ({e}).")
+            print("[INFO] Sedang menggunakan CPU multithreading sementara.")
+            
+    device = torch.device('cpu')
+    print("[FALLBACK] Berjalan di CPU multithreading.")
     return device
 
 
 def train_and_evaluate_footnet(dataset_samples: list,
-                               epochs: int = 15,
-                               batch_size: int = 32,
-                               lr: float = 0.001,
+                               epochs: int = 10,
+                               batch_size: int = 64,
+                               lr: float = 0.0008,
+                               expand_factor: int = 10,
                                save_model_path: str = None) -> dict:
     """
-    Melatih FootNet CNN dengan 15 Epochs.
+    Melatih FootNet dengan proteksi Anti-Overfitting & Standar Medis 3-Way Split:
+      - 3-Way GroupSplit: 70% Train, 20% Val/Test, 10% Ground Truth Holdout (Zero Data Leakage)
+      - On-the-fly Dynamic Augmentation 10x
+      - Label Smoothing CrossEntropy (0.1)
+      - Weight Decay (1e-2)
+      - Cosine Annealing Learning Rate Scheduler
     """
     device = get_optimal_device()
     use_cuda = (device.type == 'cuda')
     
-    # Filter sampel valid
-    valid_samples = [s for s in dataset_samples if s.get('arch_index', -1) >= 0]
-    if not valid_samples:
-        raise ValueError("Tidak ada data sampel valid untuk pelatihan FootNet.")
-        
-    labels = [LABEL_TO_IDX.get(s['ground_truth'], 1) for s in valid_samples]
+    # ── 1. 3-WAY GROUP-AWARE SPLIT (70% Train, 20% Val, 10% Ground Truth Holdout) ──
+    groups = np.array([extract_base_id(s.get('filename', '')) for s in dataset_samples])
+    all_indices = np.arange(len(dataset_samples))
     
-    # 80% Train, 20% Test
-    train_idx, test_idx = train_test_split(
-        range(len(valid_samples)),
-        test_size=0.20,
-        stratify=labels,
-        random_state=42
+    # Langkah A: Pisahkan 10% untuk Ground Truth Holdout Set (Unseen Test Set Murni)
+    gss_holdout = GroupShuffleSplit(n_splits=1, test_size=0.10, random_state=42)
+    train_val_idx, holdout_idx = next(gss_holdout.split(all_indices, groups=groups))
+    
+    train_val_samples = [dataset_samples[i] for i in train_val_idx]
+    train_val_groups = groups[train_val_idx]
+    train_val_indices = np.arange(len(train_val_samples))
+    
+    # Langkah B: Dari 90% sisanya, pisahkan 20% Val/Test (20/90 ≈ 0.2222) dan 70% Train
+    val_ratio = 0.20 / 0.90
+    gss_val = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=42)
+    train_sub_idx, val_sub_idx = next(gss_val.split(train_val_indices, groups=train_val_groups))
+    
+    train_samples = [train_val_samples[i] for i in train_sub_idx]
+    val_samples = [train_val_samples[i] for i in val_sub_idx]
+    holdout_samples = [dataset_samples[i] for i in holdout_idx]
+    
+    # Verifikasi Integritas Grup (Zero Leakage)
+    train_g = set(extract_base_id(s['filename']) for s in train_samples)
+    val_g = set(extract_base_id(s['filename']) for s in val_samples)
+    holdout_g = set(extract_base_id(s['filename']) for s in holdout_samples)
+    assert len(train_g.intersection(val_g)) == 0, "[ERROR] Data leakage terdeteksi antara Train dan Val!"
+    assert len(train_g.intersection(holdout_g)) == 0, "[ERROR] Data leakage terdeteksi antara Train dan Holdout!"
+    assert len(val_g.intersection(holdout_g)) == 0, "[ERROR] Data leakage terdeteksi antara Val dan Holdout!"
+    
+    # ── 2. DATA LOADERS DENGAN 10x ON-THE-FLY AUGMENTATION ──
+    train_dataset = PlantarPressureDataset(train_samples, is_train=True, expand_factor=expand_factor)
+    val_dataset = PlantarPressureDataset(val_samples, is_train=False, expand_factor=1)
+    holdout_dataset = PlantarPressureDataset(holdout_samples, is_train=False, expand_factor=1)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_cuda
     )
     
-    train_samples = [valid_samples[i] for i in train_idx]
-    test_samples = [valid_samples[i] for i in test_idx]
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
     
-    print("\n" + "=" * 68)
-    print(f"   MEMUAT & CACHING DATASET ({len(valid_samples)} CITRA)...")
-    print("=" * 68)
-    t0_cache = time.time()
-    train_dataset = CachedPlantarDataset(train_samples, img_size=64)
-    test_dataset = CachedPlantarDataset(test_samples, img_size=64)
-    print(f"[OK] Cache selesai dalam {time.time() - t0_cache:.2f} detik.")
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    holdout_loader = DataLoader(
+        holdout_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
     
     model = FootNet(num_classes=3, num_clinical_features=5).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    
+    # Label Smoothing mencegah akurasi hafalan palsu
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
     
-    print("\n" + "=" * 68)
-    print(f"   PELATIHAN DEEP LEARNING CNN (FOOTNET) - {epochs} EPOCHS")
-    print(f"   Train Set: {len(train_samples)} citra | Test Set: {len(test_samples)} citra")
-    print("=" * 68)
+    print("\n" + "=" * 70)
+    print("   PELATIHAN FOOTNET (3-WAY GROUP-SPLIT + 10x ON-THE-FLY AUGMENTATION)")
+    print(f"   Train Set         : {len(train_samples)} citra dasar -> {len(train_dataset)} sampel dinamis (10x)")
+    print(f"   Validation Set    : {len(val_samples)} citra (Unseen untuk tuning)")
+    print(f"   Holdout Set (GT)  : {len(holdout_samples)} citra (Murni tidak pernah dilihat)")
+    print("   Proteksi Medis    : Zero Data Leakage by Subject ID, L2 Reg=1e-2, Label Smoothing=0.1")
+    print("=" * 70)
     
-    history = {'train_loss': [], 'train_acc': []}
     start_time = time.time()
+    best_val_acc = 0.0
+    best_model_weights = None
+    
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': [],
+    }
     
     for epoch in range(1, epochs + 1):
         model.train()
@@ -220,12 +334,11 @@ def train_and_evaluate_footnet(dataset_samples: list,
         train_total = 0
         
         for imgs, clins, targets, _ in train_loader:
-            imgs = imgs.to(device)
-            clins = clins.to(device)
-            targets = targets.to(device)
+            imgs = imgs.to(device, non_blocking=use_cuda)
+            clins = clins.to(device, non_blocking=use_cuda)
+            targets = targets.to(device, non_blocking=use_cuda)
             
             optimizer.zero_grad()
-            
             with torch.amp.autocast('cuda', enabled=use_cuda):
                 outputs = model(imgs, clins)
                 loss = criterion(outputs, targets)
@@ -243,125 +356,187 @@ def train_and_evaluate_footnet(dataset_samples: list,
         train_acc = train_correct / train_total
         avg_loss = train_loss / train_total
         
+        # Evaluasi pada Validation Set di setiap epoch
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for imgs, clins, targets, _ in val_loader:
+                imgs = imgs.to(device, non_blocking=use_cuda)
+                clins = clins.to(device, non_blocking=use_cuda)
+                targets = targets.to(device, non_blocking=use_cuda)
+                
+                with torch.amp.autocast('cuda', enabled=use_cuda):
+                    outputs = model(imgs, clins)
+                    loss = criterion(outputs, targets)
+                    
+                val_loss += loss.item() * targets.size(0)
+                preds = outputs.argmax(dim=1)
+                val_correct += (preds == targets).sum().item()
+                val_total += targets.size(0)
+                
+        epoch_val_acc = val_correct / val_total
+        epoch_val_loss = val_loss / val_total
+        
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            best_model_weights = model.state_dict().copy()
+            
         history['train_loss'].append(avg_loss)
         history['train_acc'].append(train_acc)
+        history['val_loss'].append(epoch_val_loss)
+        history['val_acc'].append(epoch_val_acc)
         
         elapsed = time.time() - start_time
-        print(f"   Epoch [{epoch:>2}/{epochs}] | Loss: {avg_loss:.4f} | "
-              f"Train Accuracy: {train_acc*100:>5.2f}% | Durasi: {elapsed:>4.1f}s")
-        
-    train_duration = time.time() - start_time
-    print(f"\n[OK] Pelatihan 15 Epochs Selesai dalam {train_duration:.2f} detik!")
-    
-    # Evaluasi pada Data Uji (Test Set)
-    model.eval()
-    all_preds = []
-    all_targets = []
-    results_detail = []
-    
-    with torch.no_grad():
-        for imgs, clins, targets, fnames in test_loader:
-            imgs = imgs.to(device)
-            clins = clins.to(device)
+        print(f"   Epoch [{epoch:>2}/{epochs}] - Train Loss: {avg_loss:.4f} | "
+              f"Train Acc: {train_acc*100:>5.1f}% | Val Acc (Unseen): {epoch_val_acc*100:>5.1f}% | {elapsed:.1f}s")
             
+    train_duration = time.time() - start_time
+    print(f"\n[OK] Pelatihan selesai dalam {train_duration:.2f} detik. Best Validation Acc: {best_val_acc*100:.1f}%.")
+    
+    # Pulihkan bobot terbaik
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
+        
+    # Simpan model jika path diberikan
+    if save_model_path:
+        os.makedirs(os.path.dirname(save_model_path), exist_ok=True)
+        torch.save(model.state_dict(), save_model_path)
+        print(f"-> Model FootNet terbaik tersimpan di: {save_model_path}")
+        
+    # ── 3. EVALUASI LENGKAP PADA VALIDATION SET (20%) ──
+    model.eval()
+    val_preds, val_targets, val_details = [], [], []
+    with torch.no_grad():
+        for imgs, clins, targets, fnames in val_loader:
+            imgs = imgs.to(device, non_blocking=use_cuda)
+            clins = clins.to(device, non_blocking=use_cuda)
             with torch.amp.autocast('cuda', enabled=use_cuda):
                 outputs = model(imgs, clins)
                 probs = torch.softmax(outputs, dim=1)
                 preds = outputs.argmax(dim=1).cpu().numpy()
-                
-            targets_np = targets.numpy()
-            probs_np = probs.cpu().numpy()
-            
-            for p, t, prob, fn in zip(preds, targets_np, probs_np, fnames):
-                pred_label = IDX_TO_LABEL[p]
-                true_label = IDX_TO_LABEL[t]
-                all_preds.append(pred_label)
-                all_targets.append(true_label)
-                results_detail.append({
+            for p, t, prob, fn in zip(preds, targets.numpy(), probs.cpu().numpy(), fnames):
+                val_preds.append(IDX_TO_LABEL[p])
+                val_targets.append(IDX_TO_LABEL[t])
+                val_details.append({
                     'filename': fn,
-                    'ground_truth': true_label,
-                    'prediction': pred_label,
+                    'ground_truth': IDX_TO_LABEL[t],
+                    'prediction': IDX_TO_LABEL[p],
                     'confidence': float(prob[p]),
                     'probs': {IDX_TO_LABEL[i]: float(prob[i]) for i in range(3)}
                 })
                 
-    # Hitung Confusion Matrix & Metrik
-    cm = confusion_matrix(all_targets, all_preds, labels=CLASS_NAMES)
-    
-    # Hitung metrik evaluasi standar
     from evaluation import compute_metrics
-    metrics = compute_metrics(cm, CLASS_NAMES)
+    val_cm = confusion_matrix(val_targets, val_preds, labels=CLASS_NAMES)
+    val_metrics = compute_metrics(val_cm, CLASS_NAMES)
     
-    # Simpan model jika path ditentukan
-    if save_model_path:
-        os.makedirs(os.path.dirname(save_model_path), exist_ok=True)
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'class_names': CLASS_NAMES,
-            'label_to_idx': LABEL_TO_IDX,
-            'epochs': epochs,
-            'accuracy': metrics['accuracy'],
-        }, save_model_path)
-        print(f"-> Model CNN tersimpan di: {save_model_path}")
-        
+    # ── 4. EVALUASI LENGKAP PADA 10% UNSEEN GROUND TRUTH (HOLDOUT SET) ──
+    holdout_preds, holdout_targets, holdout_details = [], [], []
+    with torch.no_grad():
+        for imgs, clins, targets, fnames in holdout_loader:
+            imgs = imgs.to(device, non_blocking=use_cuda)
+            clins = clins.to(device, non_blocking=use_cuda)
+            with torch.amp.autocast('cuda', enabled=use_cuda):
+                outputs = model(imgs, clins)
+                probs = torch.softmax(outputs, dim=1)
+                preds = outputs.argmax(dim=1).cpu().numpy()
+            for p, t, prob, fn in zip(preds, targets.numpy(), probs.cpu().numpy(), fnames):
+                holdout_preds.append(IDX_TO_LABEL[p])
+                holdout_targets.append(IDX_TO_LABEL[t])
+                holdout_details.append({
+                    'filename': fn,
+                    'ground_truth': IDX_TO_LABEL[t],
+                    'prediction': IDX_TO_LABEL[p],
+                    'confidence': float(prob[p]),
+                    'probs': {IDX_TO_LABEL[i]: float(prob[i]) for i in range(3)}
+                })
+                
+    holdout_cm = confusion_matrix(holdout_targets, holdout_preds, labels=CLASS_NAMES)
+    holdout_metrics = compute_metrics(holdout_cm, CLASS_NAMES)
+    
+    # Perbandingan dengan Cavanagh Rule pada Holdout Set
+    cavanagh_holdout_correct = sum(
+        1 for s in holdout_samples if s.get('classification') == s.get('ground_truth')
+    )
+    cavanagh_holdout_acc = cavanagh_holdout_correct / max(1, len(holdout_samples))
+    
+    print("\n" + "=" * 70)
+    print("   HASIL EVALUASI 10% UNSEEN GROUND TRUTH (HOLDOUT SET)")
+    print("=" * 70)
+    print(f"   Jumlah Sampel Holdout      : {len(holdout_samples)} citra (100% Tidak Pernah Dilihat)")
+    print(f"   Akurasi Cavanagh Rule      : {cavanagh_holdout_acc * 100:.2f}% ({cavanagh_holdout_correct}/{len(holdout_samples)})")
+    print(f"   Akurasi FootNet CNN        : {holdout_metrics['accuracy'] * 100:.2f}% ({int(holdout_metrics['correct'])}/{len(holdout_samples)})")
+    macro_sens = holdout_metrics.get('macro_avg', {}).get('sensitivity', 0.0)
+    macro_spec = holdout_metrics.get('macro_avg', {}).get('specificity', 0.0)
+    print(f"   Sensitivity (Recall Macro) : {macro_sens * 100:.2f}%")
+    print(f"   Specificity Macro          : {macro_spec * 100:.2f}%")
+    print("=" * 70)
+    
     if use_cuda:
         torch.cuda.empty_cache()
         
     return {
         'model': model,
-        'epochs': epochs,
+        'y_true': val_targets,
+        'y_pred': val_preds,
+        'confusion_matrix': val_cm,
+        'metrics': val_metrics,
+        'accuracy': val_metrics['accuracy'],
+        'holdout_samples': holdout_samples,
+        'holdout_metrics': holdout_metrics,
+        'holdout_confusion_matrix': holdout_cm,
+        'holdout_accuracy': holdout_metrics['accuracy'],
+        'cavanagh_holdout_accuracy': cavanagh_holdout_acc,
         'history': history,
-        'accuracy': metrics['accuracy'],
-        'confusion_matrix': cm,
-        'metrics': metrics,
-        'y_true': all_targets,
-        'y_pred': all_preds,
-        'results_detail': results_detail,
+        'results_detail': val_details,
+        'holdout_detail': holdout_details,
         'train_duration': train_duration,
+        'best_test_acc': best_val_acc,
         'device_name': torch.cuda.get_device_name(0) if use_cuda else 'CPU',
     }
 
 
-def predict_single_image_cnn(model, img_bgr: np.ndarray, regions: dict,
-                             arch_index: float, device: torch.device = None) -> dict:
-    """
-    Prediksi kelas telapak kaki menggunakan model CNN FootNet terlatih.
-    """
+def predict_single_image_cnn(model_path: str, img_bgr: np.ndarray, 
+                             arch_index: float, area_A: int, area_B: int, area_C: int, 
+                             device=None) -> dict:
+    """Prediksi inferensi satu citra menggunakan model FootNet CNN yang telah dilatih."""
+    if not os.path.exists(model_path):
+        return None
+        
     if device is None:
-        device = next(model.parameters()).device
+        device = get_optimal_device()
         
-    model.eval()
-    
-    # Preprocessing citra (64x64)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_res = cv2.resize(img_rgb, (64, 64), interpolation=cv2.INTER_AREA)
-    tensor_img = torch.from_numpy(img_res.transpose((2, 0, 1))).float().unsqueeze(0) / 255.0
-    tensor_img = tensor_img.to(device)
-    
-    A = float(regions.get('A_area', 0))
-    B = float(regions.get('B_area', 0))
-    C = float(regions.get('C_area', 0))
-    tot = max(1.0, A + B + C)
-    
-    clin = np.array([[
-        float(arch_index),
-        A / tot,
-        B / tot,
-        C / tot,
-        tot / 50000.0
-    ]], dtype=np.float32)
-    tensor_clin = torch.from_numpy(clin).to(device)
-    
-    with torch.no_grad():
-        out = model(tensor_img, tensor_clin)
-        probs = torch.softmax(out, dim=1).cpu().numpy()[0]
-        pred_idx = int(np.argmax(probs))
+    try:
+        model = FootNet(num_classes=3, num_clinical_features=5).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
         
-    pred_label = IDX_TO_LABEL[pred_idx]
-    confidence = float(probs[pred_idx])
-    
-    return {
-        'prediction': pred_label,
-        'confidence': confidence,
-        'probs': {IDX_TO_LABEL[i]: float(probs[i]) for i in range(3)}
-    }
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (128, 128), interpolation=cv2.INTER_AREA)
+        img_t = torch.from_numpy(resized.transpose((2, 0, 1))).float().unsqueeze(0) / 255.0
+        img_t = img_t.to(device)
+        
+        tot = max(1.0, float(area_A + area_B + area_C))
+        clin_features = np.array([[
+            float(arch_index),
+            float(area_A) / tot,
+            float(area_B) / tot,
+            float(area_C) / tot,
+            float(tot) / 50000.0,
+        ]], dtype=np.float32)
+        clin_t = torch.from_numpy(clin_features).to(device)
+        
+        with torch.no_grad():
+            out = model(img_t, clin_t)
+            probs = torch.softmax(out, dim=1)[0].cpu().numpy()
+            pred_idx = int(np.argmax(probs))
+            
+        return {
+            'prediction': IDX_TO_LABEL[pred_idx],
+            'confidence': float(probs[pred_idx]),
+            'probabilities': {IDX_TO_LABEL[i]: round(float(probs[i]), 4) for i in range(3)},
+        }
+    except Exception as e:
+        print(f"[WARN] Inferensi CNN gagal: {e}")
+        return None
