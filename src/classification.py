@@ -19,23 +19,23 @@ CAVANAGH_THRESHOLDS = {
 
 # Threshold Terkalibrasi untuk Sensor Tekanan Plantar Digital (Electronic Mat)
 SENSOR_CALIBRATED_THRESHOLDS = {
-    'high_arch': 0.22,   # AI <= 0.22
-    'flat_foot': 0.33,   # AI >= 0.33
+    'high_arch': 0.200,   # AI <= 0.200
+    'flat_foot': 0.304,   # AI >= 0.304
 }
 
 
 def classify_arch(arch_index: float, 
                   high_thresh: float = None, 
                   flat_thresh: float = None,
-                  mode: str = 'calibrated') -> str:
+                  mode: str = 'cavanagh') -> str:
     """
     Klasifikasi tipe lengkungan kaki berdasarkan Arch Index.
     
     Mode:
-      - 'calibrated': Ambang batas terkalibrasi khusus sensor tekanan plantar digital
-                      (High Arch <= 0.22, Normal 0.22-0.33, Flat Foot >= 0.33).
       - 'cavanagh'  : Ambang batas literatur klasik Cavanagh & Rodgers 1987
                       (High Arch <= 0.21, Normal 0.21-0.26, Flat Foot >= 0.26).
+      - 'calibrated': Ambang batas terkalibrasi khusus sensor tekanan plantar digital
+                      (High Arch <= 0.200, Normal 0.200-0.304, Flat Foot >= 0.304).
     """
     if arch_index < 0:
         return 'Invalid'

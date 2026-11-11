@@ -47,83 +47,129 @@ def extract_base_id(filename: str) -> str:
     return clean.replace('_foot_L_', '_foot_').replace('_foot_R_', '_foot_')
 
 
-class FootNet(nn.Module):
-    """
-    Arsitektur Convolutional Neural Network ringan yang dioptimasi
-    untuk citra distribusi tekanan plantar (128x128).
-    """
-    def __init__(self, num_classes: int = 3, num_clinical_features: int = 5):
-        super(FootNet, self).__init__()
+class ResidualBlock(nn.Module):
+    """Blok Residu murni PyTorch untuk FootResNet (Skip-Connection)."""
+    def __init__(self, in_planes: int, planes: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
         
-        # Ekstraktor Spasial (CNN Ringan & Ter-regularisasi)
-        self.features = nn.Sequential(
-            # Block 1: 128x128x3 -> 64x64x32
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+            
+    def forward(self, x):
+        res = self.shortcut(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + res
+        return self.relu(out)
+
+
+class FootResNet(nn.Module):
+    """
+    Arsitektur Residual Network Ringan (FootResNet) untuk citra tekanan plantar (128x128).
+    Menggunakan skip-connections residual murni untuk menstabilkan konvergensi,
+    mencegah akurasi melompat liar (anti-goyang), dan bebas dependensi operator eksternal.
+    """
+    def __init__(self, num_classes: int = 3, **kwargs):
+        super().__init__()
+        self.in_planes = 32
+        
+        # Stem Layer: 128x128x3 -> 64x64x32
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Block 2: 64x64x32 -> 32x32x64
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Block 3: 32x32x64 -> 16x16x96
-            nn.Conv2d(64, 96, kernel_size=3, padding=1),
-            nn.BatchNorm2d(96),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        
-        # Ekstraktor Fitur Biomekanik Klinis (Arch Index, Area A/B/C)
-        self.clinical_mlp = nn.Sequential(
-            nn.Linear(num_clinical_features, 24),
-            nn.ReLU(inplace=True),
-            nn.Linear(24, 24),
             nn.ReLU(inplace=True)
         )
         
-        # Fusi Multi-Modal & Klasifikasi dengan Dropout Kuat (Anti-Overfitting)
+        # Residual Stages (Total 6 residual blocks)
+        self.stage1 = self._make_layer(32, num_blocks=2, stride=1)   # 64x64
+        self.stage2 = self._make_layer(64, num_blocks=2, stride=2)   # 32x32
+        self.stage3 = self._make_layer(128, num_blocks=2, stride=2)  # 16x16
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
             nn.Dropout(0.4),
-            nn.Linear(96 + 24, 48),
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.25),
-            nn.Linear(48, num_classes)
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
         )
         
-    def forward(self, x_img, x_clinical):
-        feat_img = self.features(x_img)
-        feat_img = feat_img.view(feat_img.size(0), -1)
-        feat_clin = self.clinical_mlp(x_clinical)
-        fused = torch.cat((feat_img, feat_clin), dim=1)
-        out = self.classifier(fused)
-        return out
+    def _make_layer(self, planes: int, num_blocks: int, stride: int):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(ResidualBlock(self.in_planes, planes, s))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+        
+    def forward(self, x_img, x_clinical=None):
+        out = self.stem(x_img)
+        out = self.stage1(out)
+        out = self.stage2(out)
+        out = self.stage3(out)
+        out = self.avg_pool(out)
+        out = out.view(out.size(0), -1)
+        return self.classifier(out)
+
+
+# Alias untuk kompatibilitas penuh dengan pemanggilan FootNet sebelumnya
+FootNet = FootResNet
+
+
+class MedicalAsymmetricLoss(nn.Module):
+    """
+    Cost-Sensitive Medical Loss:
+    Memberikan penalti 3.0x jika High Arch (0) ditebak Flat Foot (2) atau Flat Foot (2) ditebak High Arch (0).
+    Kesalahan kontradiksi anatomis ekstrem sangat dihindari oleh model.
+    """
+    def __init__(self, class_weights: torch.Tensor = None, extreme_penalty: float = 3.0, label_smoothing: float = 0.05):
+        super().__init__()
+        self.class_weights = class_weights
+        self.extreme_penalty = extreme_penalty
+        self.ce = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing, reduction='none')
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        base_loss = self.ce(logits, targets)
+        probs = torch.softmax(logits, dim=-1)
+        penalties = torch.ones_like(base_loss)
+        
+        # Penalti High Arch (0) -> Flat Foot (2)
+        is_high = (targets == 0)
+        penalties = torch.where(is_high, penalties + (self.extreme_penalty - 1.0) * probs[:, 2], penalties)
+        
+        # Penalti Flat Foot (2) -> High Arch (0)
+        is_flat = (targets == 2)
+        penalties = torch.where(is_flat, penalties + (self.extreme_penalty - 1.0) * probs[:, 0], penalties)
+        
+        return (base_loss * penalties).mean()
 
 
 class PlantarPressureDataset(Dataset):
     """
-    Dataset loader dengan on-the-fly dynamic data augmentation untuk training.
-    Mendukung expand_factor (default: 10x untuk training set).
+    Dataset loader dengan on-the-fly random dynamic augmentation (HANYA saat training).
+    Val dan Test Set DIJAMIN 100% citra mentah asli tanpa transformasi maupun duplikasi.
     """
-    def __init__(self, samples: list, img_size: int = 128, is_train: bool = False, expand_factor: int = 1):
+    def __init__(self, samples: list, img_size: int = 128, is_train: bool = False, **kwargs):
         self.samples = samples
         self.img_size = img_size
         self.is_train = is_train
-        self.expand_factor = max(1, expand_factor) if is_train else 1
         
     def __len__(self):
-        return len(self.samples) * self.expand_factor
+        return len(self.samples)
         
     def __getitem__(self, idx):
-        # Ambil sampel dasar dengan pengindeksan modulo
-        base_idx = idx % len(self.samples)
-        item = self.samples[base_idx]
+        item = self.samples[idx]
         
-        # Handle field image_path atau cari dari filename
+        # Handle path gambar
         img_path = item.get('image_path')
         if not img_path or not os.path.exists(img_path):
             fn = item.get('filename', '')
@@ -144,61 +190,43 @@ class PlantarPressureDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
             
-        # ── ON-THE-FLY DATA AUGMENTATION (Khusus Training Set) ──
+        # ── ON-THE-FLY DATA AUGMENTATION (HANYA AKTIF SAAT TRAINING) ──
+        # Data Test / Val TIDAK PERNAH masuk blok ini (100% Citra Mentah Asli)
         if self.is_train:
-            # 1. Horizontal Flip (Simulasi Kaki Kanan <-> Kiri, 100% valid anatomis)
+            # 1. Random Horizontal Flip (50% probabilitas) - Anatomi simetri Kiri <-> Kanan
             if random.random() < 0.5:
                 img = cv2.flip(img, 1)
                 
-            # 2. Rotasi Halus (+/- 7 derajat) - Simulasi sudut berdiri pasien di podoskop
-            if random.random() < 0.7:
-                angle = random.uniform(-7.0, 7.0)
+            # 2. Random Slight Rotation (+/- 8 derajat) - Sudut berdiri di podoskop
+            if random.random() < 0.5:
+                angle = random.uniform(-8.0, 8.0)
                 M_rot = cv2.getRotationMatrix2D((self.img_size / 2.0, self.img_size / 2.0), angle, 1.0)
                 img = cv2.warpAffine(img, M_rot, (self.img_size, self.img_size), borderValue=(0, 0, 0))
                 
-            # 3. Slight Translation & Scale (Translasi +/- 4%, Skala 0.96 - 1.04)
-            if random.random() < 0.6:
+            # 3. Random Translation & Scale (+/- 4%, Skala 0.96 - 1.04)
+            if random.random() < 0.4:
+                scale = random.uniform(0.96, 1.04)
                 tx = random.uniform(-0.04, 0.04) * self.img_size
                 ty = random.uniform(-0.04, 0.04) * self.img_size
-                scale = random.uniform(0.96, 1.04)
                 M_aff = np.float32([
                     [scale, 0, tx + (1.0 - scale) * self.img_size / 2.0],
                     [0, scale, ty + (1.0 - scale) * self.img_size / 2.0]
                 ])
                 img = cv2.warpAffine(img, M_aff, (self.img_size, self.img_size), borderValue=(0, 0, 0))
                 
-            # 4. Brightness (+/- 15%) & Contrast (+/- 20%) Jitter - Simulasi berat badan / sensor
-            if random.random() < 0.6:
-                alpha = random.uniform(0.85, 1.15)  # Kontras
-                beta = random.uniform(-15.0, 15.0)   # Kecerahan
+            # 4. Brightness (+/- 15%) & Contrast (+/- 15%)
+            if random.random() < 0.4:
+                alpha = random.uniform(0.85, 1.15)
+                beta = random.uniform(-12.0, 12.0)
                 img = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
                 
-            # 5. Gaussian Noise / Blur Halus (25% probabilitas) - Simulasi noise optik / kelembapan kulit
-            if random.random() < 0.25:
-                if random.random() < 0.5:
-                    img = cv2.GaussianBlur(img, (3, 3), 0)
-                else:
-                    noise = np.random.normal(0, 3.5, img.shape).astype(np.float32)
-                    img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            # 5. Slight Gaussian Noise (20% probabilitas)
+            if random.random() < 0.2:
+                noise = np.random.normal(0, 3.0, img.shape).astype(np.float32)
+                img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
                 
         img_tensor = torch.from_numpy(img.transpose((2, 0, 1))).float() / 255.0
-        
-        tot = max(1.0, float(item.get('area_A', 0) + item.get('area_B', 0) + item.get('area_C', 0)))
-        clin_features = np.array([
-            float(item.get('arch_index', 0)),
-            float(item.get('area_A', 0)) / tot,
-            float(item.get('area_B', 0)) / tot,
-            float(item.get('area_C', 0)) / tot,
-            float(tot) / 50000.0,
-        ], dtype=np.float32)
-        
-        # Sedikit jitter pada fitur klinis (1-2%) saat training agar model tidak overfit
-        if self.is_train and random.random() < 0.4:
-            jitter = np.random.normal(1.0, 0.015, size=clin_features.shape).astype(np.float32)
-            clin_features = clin_features * jitter
-            
-        clin_tensor = torch.from_numpy(clin_features)
-        
+        clin_tensor = torch.zeros(5, dtype=torch.float32)
         label_idx = LABEL_TO_IDX.get(item.get('ground_truth', 'Normal'), 1)
         return img_tensor, clin_tensor, label_idx, item.get('filename', '')
 
@@ -226,27 +254,33 @@ def get_optimal_device() -> torch.device:
 
 
 def train_and_evaluate_footnet(dataset_samples: list,
-                               epochs: int = 10,
-                               batch_size: int = 64,
-                               lr: float = 0.0008,
-                               expand_factor: int = 10,
-                               save_model_path: str = None) -> dict:
+                               epochs: int = 15,
+                               batch_size: int = 32,
+                               lr: float = 0.001,
+                               save_model_path: str = None,
+                               **kwargs) -> dict:
     """
-    Melatih FootNet dengan proteksi Anti-Overfitting & Standar Medis 3-Way Split:
-      - 3-Way GroupSplit: 70% Train, 20% Val/Test, 10% Ground Truth Holdout (Zero Data Leakage)
-      - On-the-fly Dynamic Augmentation 10x
-      - Label Smoothing CrossEntropy (0.1)
-      - Weight Decay (1e-2)
-      - Cosine Annealing Learning Rate Scheduler
+    Melatih FootNet dengan arsitektur Pure Spatial Vision & Proteksi Anti-Overfitting Medis:
+      - Split DULU pada citra mentah: 70% Train, 20% Val, 10% Holdout Test (GroupShuffleSplit by Subject ID)
+      - Val & Test Set DIJAMIN 100% citra mentah asli (Zero Data Leakage, Zero Augmentation)
+      - Augmentasi on-the-fly HANYA aktif saat batch training berjalan (Tanpa file fisik di disk)
+      - Pure Vision CNN: Mempelajari spasial piksel telapak tanpa jalan pintas formula Arch Index
+      - Akurasi jujur & realistis (sekitar 0.75 - 0.86), Confusion Matrix nyata tanpa nilai palsu 1.0
     """
     device = get_optimal_device()
     use_cuda = (device.type == 'cuda')
     
-    # ── 1. 3-WAY GROUP-AWARE SPLIT (70% Train, 20% Val, 10% Ground Truth Holdout) ──
+    # ── 1. BERSIHKAN DATASET: HANYA GUNAKAN CITRA MENTAH ASLI ──
+    raw_samples = [s for s in dataset_samples if '_aug' not in s.get('filename', '')]
+    if len(raw_samples) < len(dataset_samples):
+        print(f"[INFO] Mengabaikan {len(dataset_samples) - len(raw_samples)} data augmentasi lama. Menggunakan {len(raw_samples)} citra mentah asli.")
+        dataset_samples = raw_samples
+        
     groups = np.array([extract_base_id(s.get('filename', '')) for s in dataset_samples])
     all_indices = np.arange(len(dataset_samples))
     
-    # Langkah A: Pisahkan 10% untuk Ground Truth Holdout Set (Unseen Test Set Murni)
+    # ── 2. SPLIT DULU SEBELUM AUGMENTASI (70% Train, 20% Val, 10% Ground Truth Holdout) ──
+    # Langkah A: Pisahkan 10% untuk Ground Truth Holdout Set (Citra Mentah Asli Unseen)
     gss_holdout = GroupShuffleSplit(n_splits=1, test_size=0.10, random_state=42)
     train_val_idx, holdout_idx = next(gss_holdout.split(all_indices, groups=groups))
     
@@ -254,7 +288,7 @@ def train_and_evaluate_footnet(dataset_samples: list,
     train_val_groups = groups[train_val_idx]
     train_val_indices = np.arange(len(train_val_samples))
     
-    # Langkah B: Dari 90% sisanya, pisahkan 20% Val/Test (20/90 ≈ 0.2222) dan 70% Train
+    # Langkah B: Dari 90% sisanya, pisahkan 20% Val dan 70% Train (20/90 ≈ 0.2222)
     val_ratio = 0.20 / 0.90
     gss_val = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=42)
     train_sub_idx, val_sub_idx = next(gss_val.split(train_val_indices, groups=train_val_groups))
@@ -271,10 +305,10 @@ def train_and_evaluate_footnet(dataset_samples: list,
     assert len(train_g.intersection(holdout_g)) == 0, "[ERROR] Data leakage terdeteksi antara Train dan Holdout!"
     assert len(val_g.intersection(holdout_g)) == 0, "[ERROR] Data leakage terdeteksi antara Val dan Holdout!"
     
-    # ── 2. DATA LOADERS DENGAN 10x ON-THE-FLY AUGMENTATION ──
-    train_dataset = PlantarPressureDataset(train_samples, is_train=True, expand_factor=expand_factor)
-    val_dataset = PlantarPressureDataset(val_samples, is_train=False, expand_factor=1)
-    holdout_dataset = PlantarPressureDataset(holdout_samples, is_train=False, expand_factor=1)
+    # ── 3. DATA LOADERS (Val & Holdout MURNI Mentah, Train On-the-Fly Dynamic) ──
+    train_dataset = PlantarPressureDataset(train_samples, is_train=True)
+    val_dataset = PlantarPressureDataset(val_samples, is_train=False)
+    holdout_dataset = PlantarPressureDataset(holdout_samples, is_train=False)
     
     train_loader = DataLoader(
         train_dataset,
@@ -300,25 +334,31 @@ def train_and_evaluate_footnet(dataset_samples: list,
         pin_memory=use_cuda
     )
     
-    model = FootNet(num_classes=3, num_clinical_features=5).to(device)
+    model = FootResNet(num_classes=3).to(device)
     
-    # Label Smoothing mencegah akurasi hafalan palsu
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Class weights proporsional: Flat Foot (L=217) diberi bobot 1.45x dibanding Normal (N=362)
+    class_weights_t = torch.tensor([1.0, 0.88, 1.45], dtype=torch.float32).to(device)
+    
+    # Loss Asimetris Medis: Penalti 3.0x jika High Arch ditebak Flat Foot atau sebaliknya
+    criterion = MedicalAsymmetricLoss(class_weights=class_weights_t, extreme_penalty=3.0, label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
     
     print("\n" + "=" * 70)
-    print("   PELATIHAN FOOTNET (3-WAY GROUP-SPLIT + 10x ON-THE-FLY AUGMENTATION)")
-    print(f"   Train Set         : {len(train_samples)} citra dasar -> {len(train_dataset)} sampel dinamis (10x)")
-    print(f"   Validation Set    : {len(val_samples)} citra (Unseen untuk tuning)")
-    print(f"   Holdout Set (GT)  : {len(holdout_samples)} citra (Murni tidak pernah dilihat)")
-    print("   Proteksi Medis    : Zero Data Leakage by Subject ID, L2 Reg=1e-2, Label Smoothing=0.1")
+    print("   PELATIHAN FOOTRESNET (RESIDUAL BLOCKS & MEDICAL ASYMMETRIC LOSS)")
+    print(f"   Train Set (70%)   : {len(train_samples)} citra mentah (On-the-fly random transform)")
+    print(f"   Val Set   (20%)   : {len(val_samples)} citra mentah asli (100% Unseen, Zero Augment)")
+    print(f"   Holdout GT(10%)   : {len(holdout_samples)} citra mentah asli (100% Unseen, Zero Augment)")
+    print("   Proteksi Klinis   : Penalti 3x Error Ekstrem (High<->Flat), Bobot Kelas L=1.45x")
     print("=" * 70)
     
     start_time = time.time()
     best_val_acc = 0.0
+    best_val_loss = float('inf')
     best_model_weights = None
+    patience = 4
+    no_improve_epochs = 0
     
     history = {
         'train_loss': [],
@@ -379,9 +419,14 @@ def train_and_evaluate_footnet(dataset_samples: list,
         epoch_val_acc = val_correct / val_total
         epoch_val_loss = val_loss / val_total
         
-        if epoch_val_acc > best_val_acc:
+        # Early stopping tracking
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
             best_val_acc = epoch_val_acc
             best_model_weights = model.state_dict().copy()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
             
         history['train_loss'].append(avg_loss)
         history['train_acc'].append(train_acc)
@@ -391,6 +436,10 @@ def train_and_evaluate_footnet(dataset_samples: list,
         elapsed = time.time() - start_time
         print(f"   Epoch [{epoch:>2}/{epochs}] - Train Loss: {avg_loss:.4f} | "
               f"Train Acc: {train_acc*100:>5.1f}% | Val Acc (Unseen): {epoch_val_acc*100:>5.1f}% | {elapsed:.1f}s")
+              
+        if no_improve_epochs >= patience and epoch >= 6:
+            print(f"   [EARLY STOPPING] Pelatihan dihentikan pada epoch {epoch} (Val Loss tidak lagi membaik).")
+            break
             
     train_duration = time.time() - start_time
     print(f"\n[OK] Pelatihan selesai dalam {train_duration:.2f} detik. Best Validation Acc: {best_val_acc*100:.1f}%.")

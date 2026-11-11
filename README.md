@@ -218,4 +218,4 @@ Database original dapat diunduh di penyedia resmi: [IEEE DataPort - Foot Arches]
 > **PENTING**: Sistem ini dikembangkan untuk tujuan edukasi dan skrining awal kelainan biomekanik kaki berbasis citra, **BUKAN** sebagai alat penegak diagnosis medis klinis definitif. Segala keputusan klinis dan intervensi ortopedik wajib dikonsultasikan dengan dokter spesialis ortopedi atau podiatris berlisensi.
 
 ## Next Update 
-- Optimalisasi detect cuda ini gw ada rtx 5050 ga kebaca anjeng jadi berat cpu
+- Update pipeline hasil final confussion  matrix nya kacau sampe satu

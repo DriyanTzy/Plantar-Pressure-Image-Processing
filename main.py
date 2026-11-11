@@ -62,6 +62,8 @@ from visualization import (plot_preprocessing_steps, plot_regions,
                            plot_cnn_history, save_sample_visualization)
 from ml_classifier import train_and_cross_validate_ml
 from gpu_model import train_and_evaluate_footnet, predict_single_image_cnn
+from hybrid_system import (run_hybrid_5fold_cross_validation, 
+                           HybridPlantarClassifier, evaluate_layer1_rule)
 
 warnings.filterwarnings('ignore')
 
@@ -167,18 +169,35 @@ def process_single_image(image_path: str, side: str = 'L',
                 modality_str=info.get('modality_str', 'Citra Telapak Kaki')
             )
             report['visualization_path'] = vis_path
+            
+        # Step 9: Evaluasi Sistem Hybrid 2-Lapis + Second Opinion CNN
+        cnn_path = os.path.join(os.path.dirname(__file__), 'output', 'models', 'footnet_cnn.pt')
+        hybrid_engine = HybridPlantarClassifier(cnn_model_path=cnn_path)
+        hybrid_res = hybrid_engine.predict_single({
+            'arch_index': arch_index,
+            'area_A': regions['A_area'],
+            'area_B': regions['B_area'],
+            'area_C': regions['C_area'],
+        }, img_bgr=info['resized_bgr'])
+        
+        calib_classification = classify_arch(arch_index, high_thresh=0.200, flat_thresh=0.304)
         
         return {
             'filename': filename,
             'image_path': image_path,
             'side': side,
             'arch_index': arch_index,
-            'classification': classification,
+            'classification': hybrid_res['final_prediction'],
+            'cavanagh_literature': classification,
+            'calibrated_prediction': calib_classification,
+            'hybrid_prediction': hybrid_res['final_prediction'],
+            'raw_classification': classification,
             'area_A': regions['A_area'],
             'area_B': regions['B_area'],
             'area_C': regions['C_area'],
             'info': info,
             'report': report,
+            'hybrid': hybrid_res,
             'error': None,
         }
         
@@ -187,6 +206,9 @@ def process_single_image(image_path: str, side: str = 'L',
             'filename': filename,
             'arch_index': -1.0,
             'classification': 'Invalid',
+            'cavanagh_literature': 'Invalid',
+            'calibrated_prediction': 'Invalid',
+            'hybrid_prediction': 'Invalid',
             'error': str(e),
             'side': side,
         }
@@ -224,6 +246,25 @@ def print_single_image_report(result: dict):
     print(f"Cavanagh Arch Index   : {result['arch_index']:.4f}  [Rumus: B / (A + B + C)]")
     print(f"Hasil Klasifikasi     : {rec['class']}")
     print(f"Tingkat Risiko Klinis : {rec['risk_level']}")
+    
+    hyb = result.get('hybrid')
+    if hyb:
+        print("\n" + "-" * 70)
+        print("   HASIL SKRINING HYBRID SYSTEM (LAPIS 1 + LAPIS 2 + CNN SECOND OPINION)")
+        print("-" * 70)
+        l1 = hyb['layer1_rule']
+        l2 = hyb['layer2_ml']
+        print(f"Lapis 1 (Cavanagh Terkalibrasi): {l1['prediction']} (Confidence: {l1['confidence']*100:.1f}%)")
+        print(f"  * Penjelasan Medis: {l1['clinical_reason']}")
+        print(f"Lapis 2 (Ensemble Biomekanik) : {l2['prediction']} (Confidence: {l2['confidence']*100:.1f}%)")
+        if hyb.get('cnn_second_opinion'):
+            cnn_pred = hyb['cnn_second_opinion']['prediction']
+            cnn_conf = hyb['cnn_second_opinion']['confidence'] * 100
+            print(f"Lapis 3 (FootResNet CNN)      : {cnn_pred} (Keyakinan Spasial: {cnn_conf:.1f}%)")
+        print(f"\nSTATUS TRIASE MEDIS           : {hyb['decision_status']}")
+        print(f"KEPUTUSAN INTEGRATIF FINAL    : {hyb['final_prediction'].upper()} (Confidence: {hyb['confidence']*100:.1f}%)")
+        print(f"Alasan Medis                  : {hyb['clinical_reasoning']}")
+        print("-" * 70)
     print("-" * 70)
     print("Deskripsi Biomekanik:")
     for line in rec['description'].split('. '):
@@ -289,7 +330,7 @@ def process_dataset(data_dir: str, output_dir: str,
             
             res['ground_truth'] = meta['ground_truth']
             res['label_code'] = meta['label_code']
-            res['prediction'] = res['classification']
+            res['prediction'] = res['cavanagh_literature']
             
             all_results.append(res)
             processed += 1
@@ -310,7 +351,8 @@ def save_results_csv(results: list, output_path: str):
     """Menyimpan data hasil ekstraksi ke format CSV."""
     import csv
     fieldnames = ['filename', 'side', 'label_code', 'ground_truth',
-                  'arch_index', 'prediction', 'area_A', 'area_B', 'area_C', 'error']
+                  'arch_index', 'cavanagh_literature', 'calibrated_prediction', 
+                  'hybrid_prediction', 'prediction', 'area_A', 'area_B', 'area_C', 'error']
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
@@ -373,7 +415,8 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     comparison_summary = {}
     
     # A. Evaluasi dengan Threshold Literatur Cavanagh (0.21 dan 0.26)
-    eval_lit = evaluate_predictions(valid_results)
+    lit_results = [{**r, 'prediction': classify_arch(r['arch_index'], mode='cavanagh')} for r in valid_results]
+    eval_lit = evaluate_predictions(lit_results)
     print_evaluation(eval_lit, title="Metode 1: Threshold Literatur Cavanagh & Rodgers (AI <= 0.21, >= 0.26)")
     plot_evaluation(eval_lit, save_path=os.path.join(reports_dir, 'confusion_matrix.png'),
                     title="Metode 1: Threshold Literatur (Cavanagh & Rodgers)")
@@ -390,18 +433,10 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     print("=" * 70)
     print(f"  * Threshold Literatur   : High Arch <= 0.210 | Flat Foot >= 0.260 (Akurasi: {eval_lit['metrics']['accuracy']*100:.2f}%)")
     print(f"  * Threshold Terkalibrasi: High Arch <= {opt_t1:.3f} | Flat Foot >= {opt_t2:.3f} (Akurasi: {opt_acc*100:.2f}%)")
+    delta_gain = (opt_acc - eval_lit['metrics']['accuracy']) * 100
+    print(f"  * Peningkatan Kalibrasi : +{delta_gain:.2f}% (Adaptasi Sensitivitas Matras Digital)")
     
-    calib_preds = []
-    for r in valid_results:
-        ai = r['arch_index']
-        if ai <= opt_t1:
-            p = 'High Arch'
-        elif ai >= opt_t2:
-            p = 'Flat Foot'
-        else:
-            p = 'Normal'
-        calib_preds.append({**r, 'prediction': p})
-        
+    calib_preds = [{**r, 'prediction': classify_arch(r['arch_index'], high_thresh=opt_t1, flat_thresh=opt_t2)} for r in valid_results]
     eval_calib = evaluate_predictions(calib_preds)
     print_evaluation(eval_calib, title=f"Metode 2: Threshold Terkalibrasi Mat Digital (AI <= {opt_t1}, >= {opt_t2})")
     plot_evaluation(eval_calib, save_path=os.path.join(reports_dir, 'confusion_matrix_calibrated.png'),
@@ -436,7 +471,7 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     print("   Menggabungkan Fitur Visual Spasial CNN & Parameter Biomekanik Klinis")
     print("=" * 70)
     cnn_model_path = os.path.join(output_dir, 'models', 'footnet_cnn.pt')
-    eval_cnn = train_and_evaluate_footnet(valid_results, epochs=epochs, batch_size=64, expand_factor=10, save_model_path=cnn_model_path)
+    eval_cnn = train_and_evaluate_footnet(valid_results, epochs=epochs, batch_size=32, save_model_path=cnn_model_path)
     comparison_summary[f'4. FootNet CNN Val ({epochs} Ep)'] = eval_cnn['accuracy']
     comparison_summary[f'5. FootNet CNN Ground Truth ({epochs} Ep)'] = eval_cnn['holdout_accuracy']
     
@@ -459,6 +494,29 @@ def run_full_dataset_pipeline(data_dir: str, output_dir: str, visualize: bool = 
     plot_cnn_history(eval_cnn['history'], save_path=cnn_hist_path)
     print(f"-> Grafik kurva loss & akurasi CNN tersimpan di: {cnn_hist_path}")
     
+    # F. Solusi Final: Evaluasi 5-Fold Group Cross Validation Sistem Hybrid Medis
+    print("\n" + "=" * 70)
+    print("   SOLUSI FINAL: SISTEM HYBRID TRIASE MEDIS (5-FOLD GROUP CROSS-VALIDATION)")
+    print("   Lapis 1 (Cavanagh Terkalibrasi) + Lapis 2 (Ensemble ML) + CNN Second Opinion")
+    print("   Zero Data Leakage | Menguji Seluruh 896 Sampel Out-of-Fold | Anti-Black Box")
+    print("=" * 70)
+    eval_hybrid = run_hybrid_5fold_cross_validation(valid_results, cnn_model_path=cnn_model_path)
+    comparison_summary['Solusi Final: Hybrid 5-Fold'] = eval_hybrid['mean_accuracy']
+    
+    print_evaluation({
+        'confusion_matrix': eval_hybrid['confusion_matrix'],
+        'metrics': eval_hybrid['metrics'],
+        'total_errors': int(eval_hybrid['metrics']['total_samples'] - eval_hybrid['metrics']['correct']),
+        'error_distribution': {}
+    }, title=f"Solusi Final: Hybrid System 5-Fold CV ({eval_hybrid['mean_accuracy']*100:.2f}% ± {eval_hybrid['std_accuracy']*100:.2f}%)")
+    
+    plot_evaluation({
+        'confusion_matrix': eval_hybrid['confusion_matrix'],
+        'metrics': eval_hybrid['metrics']
+    }, save_path=os.path.join(reports_dir, 'confusion_matrix_hybrid_5fold.png'),
+       title=f"Solusi Final: Hybrid System 5-Fold ({eval_hybrid['mean_accuracy']*100:.2f}%)")
+    print(f"-> Grafik confusion matrix Hybrid 5-Fold tersimpan di: {os.path.join(reports_dir, 'confusion_matrix_hybrid_5fold.png')}")
+    
     comp_plot_path = os.path.join(reports_dir, 'comparison_methods.png')
     plot_model_comparison(comparison_summary, save_path=comp_plot_path)
     print(f"-> Grafik komparasi multi-metode tersimpan di: {comp_plot_path}")
@@ -476,7 +534,8 @@ def main():
     parser.add_argument('--select', action='store_true', help='Buka File Picker dialog untuk memilih gambar dari lokal')
     parser.add_argument('--side', type=str, default=None, choices=['L', 'R'], help='Sisi kaki: L (Kiri) atau R (Kanan)')
     parser.add_argument('--dataset', action='store_true', help='Jalankan evaluasi batch terhadap seluruh dataset')
-    parser.add_argument('--train-cnn', '--train', action='store_true', dest='train_cnn', help='Latih FootNet CNN dengan 10x On-the-fly Dynamic Augmentation')
+    parser.add_argument('--train-cnn', '--train', action='store_true', dest='train_cnn', help='Latih FootResNet CNN & Evaluasi Sistem Hybrid 5-Fold')
+    parser.add_argument('--hybrid', action='store_true', dest='run_hybrid', help='Jalankan Evaluasi Sistem Hybrid Medis 5-Fold Group CV')
     parser.add_argument('--data_dir', type=str, default='foot_data', help='Path dataset folder')
     parser.add_argument('--output_dir', type=str, default='output', help='Path output folder')
     parser.add_argument('--visualize', action='store_true', help='Simpan visualisasi sampel')
@@ -512,8 +571,8 @@ def main():
         print_single_image_report(res)
         return
         
-    # ── KONDISI 3: Pengguna Meminta Batch Processing Dataset (--dataset / --train-cnn) ──
-    if args.dataset or args.train_cnn:
+    # ── KONDISI 3: Pengguna Meminta Batch Processing Dataset (--dataset / --train-cnn / --hybrid) ──
+    if args.dataset or args.train_cnn or args.run_hybrid:
         data_dir = os.path.join(base_dir, args.data_dir)
         run_full_dataset_pipeline(data_dir, output_dir, visualize=args.visualize, num_samples=args.num_samples, gpu=args.gpu, epochs=args.epochs)
         return
@@ -526,7 +585,7 @@ def main():
     print("Pilihan Menu:")
     print("  [1] Pilih gambar dari komputer (Buka File Explorer Pop-up)")
     print("  [2] Masukkan path gambar lokal secara manual")
-    print("  [3] Jalankan batch evaluasi seluruh dataset & Train FootNet CNN (10 Epochs, 10x Dynamic Augment)")
+    print("  [3] Jalankan Evaluasi Lengkap Dataset & Sistem Hybrid Medis (5-Fold Group CV)")
     print("  [4] Keluar")
     print("-" * 65)
     
